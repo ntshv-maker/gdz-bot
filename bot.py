@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-ИИ ГДЗ — Telegram-бот на aiogram + SQLite + Groq (llama-3.3-70b-versatile).
+ИИ ГДЗ — Telegram-бот на aiogram + SQLite + Groq.
+Текст: llama-3.3-70b-versatile, фото: Llama 4 Scout (vision).
 Запуск: python bot.py
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import logging
 import os
@@ -29,10 +31,14 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_VISION_MODEL = os.getenv(
+    "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+)
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 DB_PATH = Path(os.getenv("DB_PATH", "gdz_bot.db"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
 
 SYSTEM_PROMPT = """Ты — умный и дружелюбный помощник по домашним заданиям (ГДЗ).
 Пользователь присылает задание — ты даёшь понятное решение с объяснением.
@@ -172,17 +178,13 @@ def split_message(text: str, limit: int = 4096) -> list[str]:
     return parts
 
 
-async def ask_groq(history: list[dict[str, str]], user_text: str) -> str:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_text})
-
+async def groq_chat(messages: list[dict], model: str) -> str:
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": GROQ_MODEL,
+        "model": model,
         "messages": messages,
         "max_tokens": MAX_TOKENS,
         "temperature": 0.4,
@@ -207,6 +209,78 @@ async def ask_groq(history: list[dict[str, str]], user_text: str) -> str:
     return content
 
 
+async def ask_groq(history: list[dict[str, str]], user_text: str) -> str:
+    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
+    return await groq_chat(messages, GROQ_MODEL)
+
+
+def build_vision_prompt(caption: str, history: list[dict[str, str]]) -> str:
+    parts: list[str] = []
+    if history:
+        parts.append("Контекст предыдущего диалога:")
+        for msg in history[-6:]:
+            role = "Ученик" if msg["role"] == "user" else "Помощник"
+            parts.append(f"{role}: {msg['content']}")
+        parts.append("")
+    if caption:
+        parts.append(f"Комментарий ученика: {caption}")
+        parts.append("")
+    parts.append(
+        "Посмотри на фото, прочитай задание и реши его. "
+        "Если текст на фото нечитаем — попроси прислать более чёткое фото."
+    )
+    return "\n".join(parts)
+
+
+async def ask_groq_vision(
+    history: list[dict[str, str]],
+    image_bytes: bytes,
+    mime_type: str,
+    caption: str,
+) -> str:
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError("Фото слишком большое (максимум 20 МБ)")
+
+    data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode()}"
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": build_vision_prompt(caption, history)},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        },
+    ]
+    return await groq_chat(messages, GROQ_VISION_MODEL)
+
+
+async def download_telegram_photo(message: Message) -> tuple[bytes, str]:
+    if not message.photo:
+        raise ValueError("Фото не найдено")
+
+    photo = message.photo[-1]
+    if photo.file_size and photo.file_size > MAX_IMAGE_BYTES:
+        raise ValueError("Фото слишком большое (максимум 20 МБ)")
+
+    bot = message.bot
+    if not bot:
+        raise RuntimeError("Bot instance недоступен")
+
+    tg_file = await bot.get_file(photo.file_id)
+    if not tg_file.file_path:
+        raise RuntimeError("Не удалось получить файл из Telegram")
+
+    buffer = await bot.download_file(tg_file.file_path)
+    data = buffer.read()
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError("Фото слишком большое (максимум 20 МБ)")
+
+    return data, "image/jpeg"
+
+
 dp = Dispatcher()
 
 
@@ -220,8 +294,8 @@ async def cmd_start(message: Message) -> None:
 
     text = (
         "<b>📚 ИИ ГДЗ</b>\n\n"
-        "Пришли мне задание — текстом или фото с подписью — "
-        "и я помогу с решением.\n\n"
+        "Пришли задание <b>текстом</b> или <b>фото</b> — "
+        "я прочитаю и помогу с решением.\n\n"
         "<b>Команды:</b>\n"
         "• /help — справка\n"
         "• /clear — очистить историю диалога"
@@ -235,10 +309,12 @@ async def cmd_help(message: Message) -> None:
         "<b>Как пользоваться ботом</b>\n\n"
         "1. Отправь текст задания — например:\n"
         "<code>Реши: 2x + 5 = 15</code>\n\n"
-        "2. Или отправь фото задания с подписью (текстом).\n\n"
+        "2. Или отправь <b>фото</b> задания из учебника.\n"
+        "   Подпись к фото необязательна.\n\n"
         "3. Бот запоминает последние сообщения для контекста.\n"
         "   Чтобы начать заново — /clear\n\n"
-        f"<i>Модель: {escape_html(GROQ_MODEL)}</i>"
+        f"<i>Текст: {escape_html(GROQ_MODEL)}</i>\n"
+        f"<i>Фото: {escape_html(GROQ_VISION_MODEL)}</i>"
     )
     await message.answer(text)
 
@@ -262,13 +338,39 @@ async def handle_text(message: Message) -> None:
 @dp.message(F.photo)
 async def handle_photo(message: Message) -> None:
     caption = (message.caption or "").strip()
-    if not caption:
-        await message.answer(
-            "📷 Отправь фото с <b>подписью</b> — опиши задание текстом.\n"
-            "Например: «Реши задачу 5 из учебника»"
+    await process_photo_task(message, caption)
+
+
+async def process_photo_task(message: Message, caption: str) -> None:
+    user = message.from_user
+    if not user:
+        return
+
+    db_user_id = upsert_user(user.id, user.username, user.first_name)
+    history = get_history(db_user_id)
+
+    status = await message.answer("📷 <i>Читаю задание с фото...</i>")
+
+    try:
+        image_bytes, mime_type = await download_telegram_photo(message)
+        answer = await ask_groq_vision(history, image_bytes, mime_type, caption)
+    except Exception as exc:
+        log.exception("Ошибка обработки фото")
+        await status.edit_text(
+            f"❌ <b>Ошибка</b>\n\n<code>{escape_html(str(exc))}</code>"
         )
         return
-    await process_task(message, caption)
+
+    db_record = "[Фото задания]" + (f" {caption}" if caption else "")
+    add_message(db_user_id, "user", db_record)
+    add_message(db_user_id, "assistant", answer)
+
+    formatted = markdown_to_html(answer)
+    parts = split_message(formatted)
+
+    await status.edit_text(parts[0])
+    for part in parts[1:]:
+        await message.answer(part)
 
 
 async def process_task(message: Message, task_text: str) -> None:
@@ -328,7 +430,9 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
-    log.info("Бот запущен (модель: %s)", GROQ_MODEL)
+    log.info(
+        "Бот запущен (текст: %s, фото: %s)", GROQ_MODEL, GROQ_VISION_MODEL
+    )
     try:
         await dp.start_polling(bot)
     finally:
