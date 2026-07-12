@@ -1,0 +1,12 @@
+services:
+  gdz_bot:
+    build: .
+    env_file: .env
+    environment:
+      DB_PATH: /data/gdz_bot.db
+    volumes:
+      - gdz_data:/data
+    restart: unless-stopped
+
+volumes:
+  gdz_data:
