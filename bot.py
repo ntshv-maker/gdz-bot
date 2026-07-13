@@ -15,7 +15,7 @@ import os
 import re
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
 
@@ -24,7 +24,14 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -40,6 +47,11 @@ DB_PATH = Path(os.getenv("DB_PATH", "gdz_bot.db"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+FREE_REQUEST_LIMIT = int(os.getenv("FREE_REQUEST_LIMIT", "3"))
+SUBSCRIPTION_PRICE_RUB = int(os.getenv("SUBSCRIPTION_PRICE_RUB", "99"))
+SUBSCRIPTION_DAYS = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
+PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
+SUBSCRIPTION_PAYLOAD_PREFIX = "gdz_sub"
 
 SYSTEM_PROMPT = """Ты — умный и дружелюбный помощник по домашним заданиям (ГДЗ).
 Пользователь присылает задание — ты даёшь понятное решение с объяснением.
@@ -122,10 +134,33 @@ def init_db() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id);
+
+            CREATE TABLE IF NOT EXISTS payments (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id                     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                telegram_payment_charge_id  TEXT NOT NULL UNIQUE,
+                amount                      INTEGER NOT NULL,
+                currency                    TEXT NOT NULL,
+                payload                     TEXT NOT NULL,
+                created_at                  TEXT NOT NULL
+            );
             """
         )
+        migrate_db(conn)
         conn.commit()
     log.info("БД готова: %s", DB_PATH.resolve())
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()
+    }
+    if "free_requests_used" not in columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN free_requests_used INTEGER NOT NULL DEFAULT 0"
+        )
+    if "subscription_until" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN subscription_until TEXT")
 
 
 def utc_now() -> str:
@@ -177,6 +212,190 @@ def clear_history(user_id: int) -> None:
     with closing(get_db()) as conn:
         conn.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
         conn.commit()
+
+
+def parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
+
+
+def has_active_subscription(db_user_id: int) -> bool:
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT subscription_until FROM users WHERE id = ?", (db_user_id,)
+        ).fetchone()
+    until = parse_dt(row["subscription_until"] if row else None)
+    return until is not None and until > datetime.now(timezone.utc)
+
+
+def get_free_requests_used(db_user_id: int) -> int:
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT free_requests_used FROM users WHERE id = ?", (db_user_id,)
+        ).fetchone()
+    return int(row["free_requests_used"]) if row else 0
+
+
+def get_access_info(db_user_id: int) -> dict[str, int | str | bool | None]:
+    subscribed = has_active_subscription(db_user_id)
+    used = get_free_requests_used(db_user_id)
+    remaining = max(FREE_REQUEST_LIMIT - used, 0)
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT subscription_until FROM users WHERE id = ?", (db_user_id,)
+        ).fetchone()
+    until = row["subscription_until"] if row else None
+    return {
+        "subscribed": subscribed,
+        "free_used": used,
+        "free_remaining": remaining if not subscribed else None,
+        "subscription_until": until,
+    }
+
+
+def can_make_request(db_user_id: int) -> bool:
+    if has_active_subscription(db_user_id):
+        return True
+    return get_free_requests_used(db_user_id) < FREE_REQUEST_LIMIT
+
+
+def consume_request(db_user_id: int) -> None:
+    if has_active_subscription(db_user_id):
+        return
+    with closing(get_db()) as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET free_requests_used = free_requests_used + 1
+            WHERE id = ?
+            """,
+            (db_user_id,),
+        )
+        conn.commit()
+
+
+def activate_subscription(db_user_id: int, days: int = SUBSCRIPTION_DAYS) -> datetime:
+    now = datetime.now(timezone.utc)
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT subscription_until FROM users WHERE id = ?", (db_user_id,)
+        ).fetchone()
+        current_until = parse_dt(row["subscription_until"] if row else None)
+        base = current_until if current_until and current_until > now else now
+        new_until = base + timedelta(days=days)
+        conn.execute(
+            """
+            UPDATE users
+            SET subscription_until = ?
+            WHERE id = ?
+            """,
+            (new_until.isoformat(), db_user_id),
+        )
+        conn.commit()
+    return new_until
+
+
+def record_payment(
+    db_user_id: int,
+    charge_id: str,
+    amount: int,
+    currency: str,
+    payload: str,
+) -> None:
+    with closing(get_db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO payments (
+                user_id, telegram_payment_charge_id, amount, currency, payload, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (db_user_id, charge_id, amount, currency, payload, utc_now()),
+        )
+        conn.commit()
+
+
+def subscribe_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"💎 Подписка {SUBSCRIPTION_PRICE_RUB} ₽/мес",
+                    callback_data="subscribe",
+                )
+            ]
+        ]
+    )
+
+
+def format_access_status(db_user_id: int) -> str:
+    info = get_access_info(db_user_id)
+    if info["subscribed"]:
+        until = parse_dt(str(info["subscription_until"]))
+        until_text = until.strftime("%d.%m.%Y") if until else "—"
+        return (
+            f"💎 <b>Подписка активна</b> до {until_text}\n"
+            "Запросы: <b>безлимит</b>"
+        )
+    remaining = int(info["free_remaining"] or 0)
+    used = int(info["free_used"])
+    return (
+        f"🆓 Бесплатных запросов: <b>{remaining}</b> из {FREE_REQUEST_LIMIT}\n"
+        f"Использовано: {used}\n\n"
+        f"Безлимит — подписка <b>{SUBSCRIPTION_PRICE_RUB} ₽/мес</b>: /subscribe"
+    )
+
+
+def paywall_text(db_user_id: int) -> str:
+    return (
+        "🚫 <b>Бесплатные запросы закончились</b>\n\n"
+        f"Ты использовал {FREE_REQUEST_LIMIT} из {FREE_REQUEST_LIMIT} бесплатных запросов.\n\n"
+        f"Оформи подписку за <b>{SUBSCRIPTION_PRICE_RUB} ₽/мес</b> — "
+        "и решай задания без ограничений."
+    )
+
+
+def usage_footer(db_user_id: int) -> str:
+    if has_active_subscription(db_user_id):
+        return ""
+    remaining = int(get_access_info(db_user_id)["free_remaining"] or 0)
+    if remaining <= 0:
+        return ""
+    return f"\n\n<i>Осталось бесплатных запросов: {remaining}</i>"
+
+
+async def send_subscription_invoice(message: Message, db_user_id: int) -> None:
+    if not PAYMENT_PROVIDER_TOKEN:
+        await message.answer(
+            "💳 Оплата пока не настроена.\n"
+            "Администратор должен подключить платёжный провайдер в BotFather "
+            "и указать PAYMENT_PROVIDER_TOKEN в .env",
+            reply_markup=subscribe_keyboard(),
+        )
+        return
+
+    bot = message.bot
+    if not bot:
+        return
+
+    payload = f"{SUBSCRIPTION_PAYLOAD_PREFIX}:{db_user_id}:{int(datetime.now(timezone.utc).timestamp())}"
+    await bot.send_invoice(
+        chat_id=message.chat.id,
+        title="ИИ ГДЗ — подписка",
+        description=(
+            f"Безлимитные запросы на {SUBSCRIPTION_DAYS} дней. "
+            f"Автопродление через Telegram не включено — продли вручную."
+        ),
+        payload=payload,
+        provider_token=PAYMENT_PROVIDER_TOKEN,
+        currency="RUB",
+        prices=[
+            LabeledPrice(
+                label=f"Подписка {SUBSCRIPTION_DAYS} дней",
+                amount=SUBSCRIPTION_PRICE_RUB * 100,
+            )
+        ],
+    )
 
 
 def looks_like_numeric_calculation(text: str) -> bool:
@@ -506,21 +725,29 @@ async def cmd_start(message: Message) -> None:
     if not user:
         return
 
-    upsert_user(user.id, user.username, user.first_name)
+    db_user_id = upsert_user(user.id, user.username, user.first_name)
 
     text = (
         "<b>📚 ИИ ГДЗ</b>\n\n"
         "Пришли задание <b>текстом</b> или <b>фото</b> — "
         "я прочитаю и помогу с решением.\n\n"
+        f"{format_access_status(db_user_id)}\n\n"
         "<b>Команды:</b>\n"
         "• /help — справка\n"
+        "• /status — баланс запросов\n"
+        "• /subscribe — оформить подписку\n"
         "• /clear — очистить историю диалога"
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=subscribe_keyboard())
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    user = message.from_user
+    db_user_id = upsert_user(
+        user.id, user.username, user.first_name
+    ) if user else 0
+
     text = (
         "<b>Как пользоваться ботом</b>\n\n"
         "1. Отправь текст задания — например:\n"
@@ -529,10 +756,79 @@ async def cmd_help(message: Message) -> None:
         "   Подпись к фото необязательна.\n\n"
         "3. Бот запоминает последние сообщения для контекста.\n"
         "   Чтобы начать заново — /clear\n\n"
-        f"<i>Текст: {escape_html(GROQ_MODEL)}</i>\n"
+        f"🆓 Бесплатно: <b>{FREE_REQUEST_LIMIT}</b> запроса на пользователя.\n"
+        f"💎 Подписка: <b>{SUBSCRIPTION_PRICE_RUB} ₽/мес</b> — безлимит (/subscribe)\n\n"
+        + (format_access_status(db_user_id) + "\n\n" if db_user_id else "")
+        + f"<i>Текст: {escape_html(GROQ_MODEL)}</i>\n"
         f"<i>Фото: {escape_html(GROQ_VISION_MODEL)}</i>"
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=subscribe_keyboard())
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    db_user_id = upsert_user(user.id, user.username, user.first_name)
+    await message.answer(
+        format_access_status(db_user_id),
+        reply_markup=subscribe_keyboard(),
+    )
+
+
+@dp.message(Command("subscribe"))
+async def cmd_subscribe(message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    db_user_id = upsert_user(user.id, user.username, user.first_name)
+    await send_subscription_invoice(message, db_user_id)
+
+
+@dp.callback_query(F.data == "subscribe")
+async def callback_subscribe(callback: CallbackQuery) -> None:
+    user = callback.from_user
+    message = callback.message
+    if not user or not message:
+        return
+    await callback.answer()
+    db_user_id = upsert_user(user.id, user.username, user.first_name)
+    await send_subscription_invoice(message, db_user_id)
+
+
+@dp.pre_checkout_query()
+async def pre_checkout_handler(query: PreCheckoutQuery) -> None:
+    payload = query.invoice_payload or ""
+    if not payload.startswith(f"{SUBSCRIPTION_PAYLOAD_PREFIX}:"):
+        await query.answer(ok=False, error_message="Неизвестный тип оплаты")
+        return
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: Message) -> None:
+    user = message.from_user
+    payment = message.successful_payment
+    if not user or not payment:
+        return
+
+    db_user_id = upsert_user(user.id, user.username, user.first_name)
+    until = activate_subscription(db_user_id, SUBSCRIPTION_DAYS)
+    record_payment(
+        db_user_id,
+        payment.telegram_payment_charge_id,
+        payment.total_amount,
+        payment.currency,
+        payment.invoice_payload,
+    )
+
+    await message.answer(
+        "✅ <b>Оплата прошла успешно!</b>\n\n"
+        f"Подписка активна до <b>{until.strftime('%d.%m.%Y')}</b>.\n"
+        "Теперь запросы без ограничений — присылай задания.",
+        reply_markup=subscribe_keyboard(),
+    )
 
 
 @dp.message(Command("clear"))
@@ -563,6 +859,14 @@ async def process_photo_task(message: Message, caption: str) -> None:
         return
 
     db_user_id = upsert_user(user.id, user.username, user.first_name)
+
+    if not can_make_request(db_user_id):
+        await message.answer(
+            paywall_text(db_user_id),
+            reply_markup=subscribe_keyboard(),
+        )
+        return
+
     history = get_history(db_user_id)
 
     status = await message.answer("📷 <i>Читаю задание с фото...</i>")
@@ -586,9 +890,11 @@ async def process_photo_task(message: Message, caption: str) -> None:
         db_record += f" ({caption})"
     add_message(db_user_id, "user", db_record)
     add_message(db_user_id, "assistant", answer)
+    consume_request(db_user_id)
 
     header = f"📝 <b>Распознано:</b> <code>{escape_html(extracted)}</code>\n\n"
     formatted = header + format_for_telegram(answer)
+    formatted += usage_footer(db_user_id)
     parts = split_message(formatted)
 
     await status.edit_text(parts[0])
@@ -607,6 +913,14 @@ async def process_task(message: Message, task_text: str) -> None:
         return
 
     db_user_id = upsert_user(user.id, user.username, user.first_name)
+
+    if not can_make_request(db_user_id):
+        await message.answer(
+            paywall_text(db_user_id),
+            reply_markup=subscribe_keyboard(),
+        )
+        return
+
     history = get_history(db_user_id)
 
     status = await message.answer("⏳ <i>Думаю над решением...</i>")
@@ -623,8 +937,9 @@ async def process_task(message: Message, task_text: str) -> None:
 
     add_message(db_user_id, "user", task_text)
     add_message(db_user_id, "assistant", answer)
+    consume_request(db_user_id)
 
-    formatted = format_for_telegram(answer)
+    formatted = format_for_telegram(answer) + usage_footer(db_user_id)
     parts = split_message(formatted)
 
     await status.edit_text(parts[0])
@@ -657,6 +972,10 @@ async def main() -> None:
     log.info(
         "Бот запущен (текст: %s, фото: %s)", GROQ_MODEL, GROQ_VISION_MODEL
     )
+    if not PAYMENT_PROVIDER_TOKEN:
+        log.warning(
+            "PAYMENT_PROVIDER_TOKEN не задан — оплата подписки недоступна"
+        )
     try:
         await dp.start_polling(bot)
     finally:
