@@ -18,6 +18,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -47,7 +48,8 @@ DB_PATH = Path(os.getenv("DB_PATH", "gdz_bot.db"))
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "10"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2048"))
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
-FREE_REQUEST_LIMIT = int(os.getenv("FREE_REQUEST_LIMIT", "3"))
+DAILY_FREE_LIMIT = int(os.getenv("DAILY_FREE_LIMIT", os.getenv("FREE_REQUEST_LIMIT", "5")))
+DAILY_TIMEZONE = ZoneInfo(os.getenv("DAILY_TIMEZONE", "Europe/Moscow"))
 SUBSCRIPTION_PRICE_RUB = int(os.getenv("SUBSCRIPTION_PRICE_RUB", "99"))
 SUBSCRIPTION_DAYS = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
 PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
@@ -161,6 +163,12 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         )
     if "subscription_until" not in columns:
         conn.execute("ALTER TABLE users ADD COLUMN subscription_until TEXT")
+    if "free_requests_date" not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN free_requests_date TEXT")
+
+
+def today_key() -> str:
+    return datetime.now(DAILY_TIMEZONE).date().isoformat()
 
 
 def utc_now() -> str:
@@ -232,15 +240,21 @@ def has_active_subscription(db_user_id: int) -> bool:
 def get_free_requests_used(db_user_id: int) -> int:
     with closing(get_db()) as conn:
         row = conn.execute(
-            "SELECT free_requests_used FROM users WHERE id = ?", (db_user_id,)
+            """
+            SELECT free_requests_used, free_requests_date
+            FROM users WHERE id = ?
+            """,
+            (db_user_id,),
         ).fetchone()
-    return int(row["free_requests_used"]) if row else 0
+    if not row or row["free_requests_date"] != today_key():
+        return 0
+    return int(row["free_requests_used"])
 
 
 def get_access_info(db_user_id: int) -> dict[str, int | str | bool | None]:
     subscribed = has_active_subscription(db_user_id)
     used = get_free_requests_used(db_user_id)
-    remaining = max(FREE_REQUEST_LIMIT - used, 0)
+    remaining = max(DAILY_FREE_LIMIT - used, 0)
     with closing(get_db()) as conn:
         row = conn.execute(
             "SELECT subscription_until FROM users WHERE id = ?", (db_user_id,)
@@ -257,21 +271,35 @@ def get_access_info(db_user_id: int) -> dict[str, int | str | bool | None]:
 def can_make_request(db_user_id: int) -> bool:
     if has_active_subscription(db_user_id):
         return True
-    return get_free_requests_used(db_user_id) < FREE_REQUEST_LIMIT
+    return get_free_requests_used(db_user_id) < DAILY_FREE_LIMIT
 
 
 def consume_request(db_user_id: int) -> None:
     if has_active_subscription(db_user_id):
         return
+    today = today_key()
     with closing(get_db()) as conn:
-        conn.execute(
-            """
-            UPDATE users
-            SET free_requests_used = free_requests_used + 1
-            WHERE id = ?
-            """,
-            (db_user_id,),
-        )
+        row = conn.execute(
+            "SELECT free_requests_date FROM users WHERE id = ?", (db_user_id,)
+        ).fetchone()
+        if row and row["free_requests_date"] == today:
+            conn.execute(
+                """
+                UPDATE users
+                SET free_requests_used = free_requests_used + 1
+                WHERE id = ?
+                """,
+                (db_user_id,),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE users
+                SET free_requests_used = 1, free_requests_date = ?
+                WHERE id = ?
+                """,
+                (today, db_user_id),
+            )
         conn.commit()
 
 
@@ -340,17 +368,19 @@ def format_access_status(db_user_id: int) -> str:
     remaining = int(info["free_remaining"] or 0)
     used = int(info["free_used"])
     return (
-        f"🆓 Бесплатных запросов: <b>{remaining}</b> из {FREE_REQUEST_LIMIT}\n"
-        f"Использовано: {used}\n\n"
+        f"🆓 Сегодня: <b>{remaining}</b> из {DAILY_FREE_LIMIT} бесплатных запросов\n"
+        f"Использовано сегодня: {used}\n"
+        "<i>Лимит обновляется каждый день в 00:00 (МСК)</i>\n\n"
         f"Безлимит — подписка <b>{SUBSCRIPTION_PRICE_RUB} ₽/мес</b>: /subscribe"
     )
 
 
 def paywall_text(db_user_id: int) -> str:
     return (
-        "🚫 <b>Бесплатные запросы закончились</b>\n\n"
-        f"Ты использовал {FREE_REQUEST_LIMIT} из {FREE_REQUEST_LIMIT} бесплатных запросов.\n\n"
-        f"Оформи подписку за <b>{SUBSCRIPTION_PRICE_RUB} ₽/мес</b> — "
+        "🚫 <b>Лимит на сегодня исчерпан</b>\n\n"
+        f"Ты использовал {DAILY_FREE_LIMIT} из {DAILY_FREE_LIMIT} бесплатных запросов за сегодня.\n"
+        "Завтра лимит обновится.\n\n"
+        f"Или оформи подписку за <b>{SUBSCRIPTION_PRICE_RUB} ₽/мес</b> — "
         "и решай задания без ограничений."
     )
 
@@ -361,7 +391,7 @@ def usage_footer(db_user_id: int) -> str:
     remaining = int(get_access_info(db_user_id)["free_remaining"] or 0)
     if remaining <= 0:
         return ""
-    return f"\n\n<i>Осталось бесплатных запросов: {remaining}</i>"
+    return f"\n\n<i>Осталось бесплатных запросов сегодня: {remaining}</i>"
 
 
 async def send_subscription_invoice(message: Message, db_user_id: int) -> None:
@@ -756,7 +786,7 @@ async def cmd_help(message: Message) -> None:
         "   Подпись к фото необязательна.\n\n"
         "3. Бот запоминает последние сообщения для контекста.\n"
         "   Чтобы начать заново — /clear\n\n"
-        f"🆓 Бесплатно: <b>{FREE_REQUEST_LIMIT}</b> запроса на пользователя.\n"
+        f"🆓 Бесплатно: <b>{DAILY_FREE_LIMIT}</b> запросов в сутки.\n"
         f"💎 Подписка: <b>{SUBSCRIPTION_PRICE_RUB} ₽/мес</b> — безлимит (/subscribe)\n\n"
         + (format_access_status(db_user_id) + "\n\n" if db_user_id else "")
         + f"<i>Текст: {escape_html(GROQ_MODEL)}</i>\n"
